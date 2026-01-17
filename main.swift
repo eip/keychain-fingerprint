@@ -8,18 +8,21 @@ func authenticateWithTouchID(reason: String) -> Bool {
     let context = LAContext()
     var error: NSError?
 
-    // Check if Touch ID is available
-    guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+    // Check if Authentication is available
+    guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
         if let error = error {
-            fputs("Touch ID not available: \(error.localizedDescription)\n", stderr)
+            fputs("Authentication not available: \(error.localizedDescription)\n", stderr)
         }
         return false
     }
 
+    // Allow password fallback
+    context.localizedFallbackTitle = "Enter Password"
+
     let semaphore = DispatchSemaphore(value: 0)
     var success = false
 
-    context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { result, authError in
+    context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { result, authError in
         success = result
         if let authError = authError {
             fputs("Authentication failed: \(authError.localizedDescription)\n", stderr)
@@ -209,7 +212,7 @@ func main() {
         let account = args[3]
 
         // Touch ID authentication
-        guard authenticateWithTouchID(reason: "Keychain 비밀번호 조회를 위해 인증이 필요합니다") else {
+        guard authenticateWithTouchID(reason: "Keychain authenticate to retrieve password") else {
             exit(1)
         }
 
@@ -229,7 +232,7 @@ func main() {
         let account = args[3]
 
         // Touch ID authentication first
-        guard authenticateWithTouchID(reason: "Keychain 비밀번호 저장을 위해 인증이 필요합니다") else {
+        guard authenticateWithTouchID(reason: "Keychain authenticate to save password") else {
             exit(1)
         }
 
@@ -255,7 +258,7 @@ func main() {
         let account = args[3]
 
         // Touch ID authentication
-        guard authenticateWithTouchID(reason: "Keychain 비밀번호 삭제를 위해 인증이 필요합니다") else {
+        guard authenticateWithTouchID(reason: "Keychain authenticate to delete password") else {
             exit(1)
         }
 
@@ -267,7 +270,7 @@ func main() {
 
     case "list":
         // Touch ID authentication
-        guard authenticateWithTouchID(reason: "Keychain 목록 조회를 위해 인증이 필요합니다") else {
+        guard authenticateWithTouchID(reason: "Keychain authenticate to list items") else {
             exit(1)
         }
 
