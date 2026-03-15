@@ -38,7 +38,13 @@ swiftc -o keychain-fingerprint main.swift -framework LocalAuthentication -framew
 
 # Install (optional)
 sudo cp keychain-fingerprint /usr/local/bin/
+
+# IMPORTANT: Set root ownership (security)
+sudo chown root:wheel keychain-fingerprint
+sudo chmod 755 keychain-fingerprint
 ```
+
+> ⚠️ **Security Note**: The binary must be owned by root with execute-only permission for regular users. This prevents malicious code injection into a tool that accesses Keychain.
 
 ## Usage
 
