@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import LocalAuthentication
 import Security
@@ -5,6 +6,13 @@ import Security
 // MARK: - Touch ID Authentication
 
 let authenticationCacheWindow: TimeInterval = 60
+let authenticationCacheSecretService = "keychain-fingerprint.internal"
+let authenticationCacheSecretAccount = "auth-cache-signing-key"
+
+struct AuthenticationCacheEntry: Codable {
+    let timestamp: Int64
+    let signature: String
+}
 
 func authenticationCacheURL() -> URL {
     FileManager.default.homeDirectoryForCurrentUser
@@ -15,25 +23,146 @@ func authenticationCacheURL() -> URL {
         .appendingPathComponent("auth-cache.json")
 }
 
-func loadAuthenticationCache(now: Date = Date()) -> [String: TimeInterval] {
+func authenticationCacheSecretQuery() -> [String: Any] {
+    [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: authenticationCacheSecretService,
+        kSecAttrAccount as String: authenticationCacheSecretAccount,
+    ]
+}
+
+func generateAuthenticationCacheSecret(length: Int = 32) -> Data? {
+    var bytes = [UInt8](repeating: 0, count: length)
+    let status = bytes.withUnsafeMutableBytes { buffer in
+        SecRandomCopyBytes(kSecRandomDefault, buffer.count, buffer.baseAddress!)
+    }
+
+    guard status == errSecSuccess else {
+        fputs(
+            "Warning: Failed to generate authentication cache secret (status: \(status))\n",
+            stderr
+        )
+        return nil
+    }
+
+    return Data(bytes)
+}
+
+func getAuthenticationCacheSigningKey() -> SymmetricKey? {
+    let query = authenticationCacheSecretQuery().merging([
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+    ]) { _, newValue in
+        newValue
+    }
+
+    var result: AnyObject?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+    if status == errSecSuccess, let data = result as? Data {
+        return SymmetricKey(data: data)
+    }
+
+    if status != errSecItemNotFound {
+        fputs(
+            "Warning: Failed to read authentication cache secret (status: \(status))\n",
+            stderr
+        )
+        return nil
+    }
+
+    guard let secretData = generateAuthenticationCacheSecret() else {
+        return nil
+    }
+
+    let addQuery = authenticationCacheSecretQuery().merging([
+        kSecValueData as String: secretData,
+        kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+    ]) { _, newValue in
+        newValue
+    }
+
+    let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+    if addStatus == errSecSuccess {
+        return SymmetricKey(data: secretData)
+    }
+
+    if addStatus == errSecDuplicateItem {
+        return getAuthenticationCacheSigningKey()
+    }
+
+    fputs(
+        "Warning: Failed to save authentication cache secret (status: \(addStatus))\n",
+        stderr
+    )
+    return nil
+}
+
+func authenticationCacheSignature(
+    for cacheKey: String,
+    timestamp: Int64,
+    using signingKey: SymmetricKey
+) -> String {
+    let payload = Data("\(cacheKey)\n\(timestamp)".utf8)
+    let signature = HMAC<SHA256>.authenticationCode(for: payload, using: signingKey)
+    return Data(signature).base64EncodedString()
+}
+
+func loadAuthenticationCache(now: Date = Date()) -> [String: Int64] {
+    guard let signingKey = getAuthenticationCacheSigningKey() else {
+        return [:]
+    }
+
     let url = authenticationCacheURL()
     guard let data = try? Data(contentsOf: url),
         let cache = try? JSONDecoder().decode(
-            [String: TimeInterval].self,
+            [String: AuthenticationCacheEntry].self,
             from: data
         )
     else {
         return [:]
     }
 
-    let cutoff = now.timeIntervalSince1970 - authenticationCacheWindow
-    return cache.filter { $0.value >= cutoff }
+    let cutoff = Int64(now.timeIntervalSince1970 - authenticationCacheWindow)
+    var verifiedCache: [String: Int64] = [:]
+
+    for (cacheKey, entry) in cache {
+        let expectedSignature = authenticationCacheSignature(
+            for: cacheKey,
+            timestamp: entry.timestamp,
+            using: signingKey
+        )
+
+        guard entry.signature == expectedSignature, entry.timestamp >= cutoff else {
+            continue
+        }
+
+        verifiedCache[cacheKey] = entry.timestamp
+    }
+
+    return verifiedCache
 }
 
-func saveAuthenticationCache(_ cache: [String: TimeInterval]) {
+func saveAuthenticationCache(_ cache: [String: Int64]) {
+    guard let signingKey = getAuthenticationCacheSigningKey() else {
+        return
+    }
+
     let fileManager = FileManager.default
     let url = authenticationCacheURL()
     let directoryURL = url.deletingLastPathComponent()
+
+    var signedCache: [String: AuthenticationCacheEntry] = [:]
+    for (cacheKey, timestamp) in cache {
+        signedCache[cacheKey] = AuthenticationCacheEntry(
+            timestamp: timestamp,
+            signature: authenticationCacheSignature(
+                for: cacheKey,
+                timestamp: timestamp,
+                using: signingKey
+            )
+        )
+    }
 
     do {
         try fileManager.createDirectory(
@@ -42,7 +171,7 @@ func saveAuthenticationCache(_ cache: [String: TimeInterval]) {
             attributes: [.posixPermissions: 0o700]
         )
 
-        let data = try JSONEncoder().encode(cache)
+        let data = try JSONEncoder().encode(signedCache)
         try data.write(to: url, options: .atomic)
         try fileManager.setAttributes(
             [.posixPermissions: 0o600],
@@ -59,18 +188,18 @@ func saveAuthenticationCache(_ cache: [String: TimeInterval]) {
 func hasRecentAuthentication(for cacheKey: String, now: Date = Date()) -> Bool {
     let cache = loadAuthenticationCache(now: now)
     return cache[cacheKey].map {
-        $0 >= now.timeIntervalSince1970 - authenticationCacheWindow
+        TimeInterval($0) >= now.timeIntervalSince1970 - authenticationCacheWindow
     } ?? false
 }
 
 func rememberAuthentication(for cacheKey: String, now: Date = Date()) {
     var cache = loadAuthenticationCache(now: now)
-    cache[cacheKey] = now.timeIntervalSince1970
+    cache[cacheKey] = Int64(now.timeIntervalSince1970)
     saveAuthenticationCache(cache)
 }
 
-func authenticateWithTouchID(reason: String, account: String) -> Bool {
-    if hasRecentAuthentication(for: account) {
+func authenticateWithTouchID(reason: String, cacheKey: String) -> Bool {
+    if hasRecentAuthentication(for: cacheKey) {
         return true
     }
 
@@ -110,10 +239,15 @@ func authenticateWithTouchID(reason: String, account: String) -> Bool {
     semaphore.wait()
 
     if success {
-        rememberAuthentication(for: account)
+        rememberAuthentication(for: cacheKey)
     }
 
     return success
+}
+
+func isInternalKeychainItem(service: String, account: String) -> Bool {
+    service == authenticationCacheSecretService
+        && account == authenticationCacheSecretAccount
 }
 
 // MARK: - Keychain Operations
@@ -218,7 +352,8 @@ func listKeychainItems(service: String? = nil) -> [(
     if status == errSecSuccess, let itemList = result as? [[String: Any]] {
         for item in itemList {
             if let service = item[kSecAttrService as String] as? String,
-                let account = item[kSecAttrAccount as String] as? String
+                let account = item[kSecAttrAccount as String] as? String,
+                !isInternalKeychainItem(service: service, account: account)
             {
                 items.append((service: service, account: account))
             }
@@ -302,11 +437,16 @@ func main() {
         let service = args[2]
         let account = args[3]
 
+        guard !isInternalKeychainItem(service: service, account: account) else {
+            fputs("Error: Access to internal keychain items is not allowed\n", stderr)
+            exit(1)
+        }
+
         // Touch ID authentication
         guard
             authenticateWithTouchID(
                 reason: "access the password of \(account)@\(service)",
-                account: "\(account)@\(service)"
+                cacheKey: "\(account)@\(service)"
             )
         else {
             exit(1)
@@ -330,11 +470,16 @@ func main() {
         let service = args[2]
         let account = args[3]
 
+        guard !isInternalKeychainItem(service: service, account: account) else {
+            fputs("Error: Access to internal keychain items is not allowed\n", stderr)
+            exit(1)
+        }
+
         // Touch ID authentication first
         guard
             authenticateWithTouchID(
                 reason: "set the password of \(account)@\(service)",
-                account: "\(account)@\(service)"
+                cacheKey: "\(account)@\(service)"
             )
         else {
             exit(1)
@@ -365,11 +510,16 @@ func main() {
         let service = args[2]
         let account = args[3]
 
+        guard !isInternalKeychainItem(service: service, account: account) else {
+            fputs("Error: Access to internal keychain items is not allowed\n", stderr)
+            exit(1)
+        }
+
         // Touch ID authentication
         guard
             authenticateWithTouchID(
                 reason: "delete the password of \(account)@\(service).",
-                account: "\(account)@\(service)"
+                cacheKey: "\(account)@\(service)"
             )
         else {
             exit(1)
@@ -386,7 +536,7 @@ func main() {
         guard
             authenticateWithTouchID(
                 reason: "list items in your keychains",
-                account: "list"
+                cacheKey: "list"
             )
         else {
             exit(1)
