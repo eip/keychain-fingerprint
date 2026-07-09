@@ -4,33 +4,115 @@ import Security
 
 // MARK: - Touch ID Authentication
 
-func authenticateWithTouchID(reason: String) -> Bool {
+let authenticationCacheWindow: TimeInterval = 60
+
+func authenticationCacheURL() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(
+            "Library/Caches/keychain-fingerprint",
+            isDirectory: true
+        )
+        .appendingPathComponent("auth-cache.json")
+}
+
+func loadAuthenticationCache(now: Date = Date()) -> [String: TimeInterval] {
+    let url = authenticationCacheURL()
+    guard let data = try? Data(contentsOf: url),
+        let cache = try? JSONDecoder().decode(
+            [String: TimeInterval].self,
+            from: data
+        )
+    else {
+        return [:]
+    }
+
+    let cutoff = now.timeIntervalSince1970 - authenticationCacheWindow
+    return cache.filter { $0.value >= cutoff }
+}
+
+func saveAuthenticationCache(_ cache: [String: TimeInterval]) {
+    let fileManager = FileManager.default
+    let url = authenticationCacheURL()
+    let directoryURL = url.deletingLastPathComponent()
+
+    do {
+        try fileManager.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        let data = try JSONEncoder().encode(cache)
+        try data.write(to: url, options: .atomic)
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+    } catch {
+        fputs(
+            "Warning: Failed to update authentication cache: \(error.localizedDescription)\n",
+            stderr
+        )
+    }
+}
+
+func hasRecentAuthentication(for cacheKey: String, now: Date = Date()) -> Bool {
+    let cache = loadAuthenticationCache(now: now)
+    return cache[cacheKey].map {
+        $0 >= now.timeIntervalSince1970 - authenticationCacheWindow
+    } ?? false
+}
+
+func rememberAuthentication(for cacheKey: String, now: Date = Date()) {
+    var cache = loadAuthenticationCache(now: now)
+    cache[cacheKey] = now.timeIntervalSince1970
+    saveAuthenticationCache(cache)
+}
+
+func authenticateWithTouchID(reason: String, account: String) -> Bool {
+    if hasRecentAuthentication(for: account) {
+        return true
+    }
+
     let context = LAContext()
     var error: NSError?
-
-    // Check if Authentication is available
-    guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
-        if let error = error {
-            fputs("Authentication not available: \(error.localizedDescription)\n", stderr)
-        }
-        return false
-    }
 
     // Allow password fallback
     context.localizedFallbackTitle = "Enter Password"
 
+    // Check if Authentication is available
+    guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error)
+    else {
+        if let error = error {
+            fputs(
+                "Authentication not available: \(error.localizedDescription)\n",
+                stderr
+            )
+        }
+        return false
+    }
+
     let semaphore = DispatchSemaphore(value: 0)
     var success = false
 
-    context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { result, authError in
+    context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
+    { result, authError in
         success = result
         if let authError = authError {
-            fputs("Authentication failed: \(authError.localizedDescription)\n", stderr)
+            fputs(
+                "Authentication failed: \(authError.localizedDescription)\n",
+                stderr
+            )
         }
         semaphore.signal()
     }
 
     semaphore.wait()
+
+    if success {
+        rememberAuthentication(for: account)
+    }
+
     return success
 }
 
@@ -42,7 +124,7 @@ func getKeychainPassword(service: String, account: String) -> String? {
         kSecAttrService as String: service,
         kSecAttrAccount as String: account,
         kSecReturnData as String: true,
-        kSecMatchLimit as String: kSecMatchLimitOne
+        kSecMatchLimit as String: kSecMatchLimitOne,
     ]
 
     var result: AnyObject?
@@ -61,12 +143,14 @@ func getKeychainPassword(service: String, account: String) -> String? {
     return nil
 }
 
-func setKeychainPassword(service: String, account: String, password: String) -> Bool {
+func setKeychainPassword(service: String, account: String, password: String)
+    -> Bool
+{
     // First, try to delete existing item
     let deleteQuery: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
-        kSecAttrAccount as String: account
+        kSecAttrAccount as String: account,
     ]
     SecItemDelete(deleteQuery as CFDictionary)
 
@@ -82,7 +166,8 @@ func setKeychainPassword(service: String, account: String, password: String) -> 
         kSecAttrService as String: service,
         kSecAttrAccount as String: account,
         kSecValueData as String: passwordData,
-        kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        kSecAttrAccessible as String:
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
     ]
 
     let status = SecItemAdd(addQuery as CFDictionary, nil)
@@ -99,7 +184,7 @@ func deleteKeychainPassword(service: String, account: String) -> Bool {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
-        kSecAttrAccount as String: account
+        kSecAttrAccount as String: account,
     ]
 
     let status = SecItemDelete(query as CFDictionary)
@@ -112,11 +197,13 @@ func deleteKeychainPassword(service: String, account: String) -> Bool {
     return false
 }
 
-func listKeychainItems(service: String? = nil) -> [(service: String, account: String)] {
+func listKeychainItems(service: String? = nil) -> [(
+    service: String, account: String
+)] {
     var query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecReturnAttributes as String: true,
-        kSecMatchLimit as String: kSecMatchLimitAll
+        kSecMatchLimit as String: kSecMatchLimitAll,
     ]
 
     if let service = service {
@@ -131,7 +218,8 @@ func listKeychainItems(service: String? = nil) -> [(service: String, account: St
     if status == errSecSuccess, let itemList = result as? [[String: Any]] {
         for item in itemList {
             if let service = item[kSecAttrService as String] as? String,
-               let account = item[kSecAttrAccount as String] as? String {
+                let account = item[kSecAttrAccount as String] as? String
+            {
                 items.append((service: service, account: account))
             }
         }
@@ -154,7 +242,7 @@ func readSecurePassword() -> String? {
     defer {
         // Restore echo
         tcsetattr(FileHandle.standardInput.fileDescriptor, TCSANOW, &oldTermios)
-        print("") // New line after hidden input
+        print("")  // New line after hidden input
     }
 
     return readLine()
@@ -163,32 +251,35 @@ func readSecurePassword() -> String? {
 // MARK: - Main
 
 func printUsage() {
-    fputs("""
-    Usage: keychain-fingerprint <command> [options]
+    fputs(
+        """
+        Usage: keychain-fingerprint <command> [options]
 
-    Commands:
-      get <service> <account>     Get password (requires Touch ID)
-      set <service> <account>     Set password (requires Touch ID)
-      delete <service> <account>  Delete password (requires Touch ID)
-      list [service]              List items (requires Touch ID)
+        Commands:
+          get <service> <account>     Get password (requires Touch ID)
+          set <service> <account>     Set password (requires Touch ID)
+          delete <service> <account>  Delete password (requires Touch ID)
+          list [service]              List items (requires Touch ID)
 
-    Security:
-      - All commands require Touch ID authentication
-      - Passwords stored in macOS Keychain (encrypted)
-      - Password input is hidden (no echo)
-      - Other apps require Mac password to access
+        Security:
+          - All commands require Touch ID authentication
+          - Passwords stored in macOS Keychain (encrypted)
+          - Password input is hidden (no echo)
+          - Other apps require Mac password to access
 
-    Examples:
-      keychain-fingerprint get myapp user@example.com
-      keychain-fingerprint set myapp user@example.com
-      keychain-fingerprint list
-      keychain-fingerprint delete myapp user@example.com
+        Examples:
+          keychain-fingerprint get myapp user@example.com
+          keychain-fingerprint set myapp user@example.com
+          keychain-fingerprint list
+          keychain-fingerprint delete myapp user@example.com
 
-    Shell variable usage:
-      PASSWORD=$(keychain-fingerprint get myapp user@example.com)
-      # use $PASSWORD
-      unset PASSWORD
-    """, stderr)
+        Shell variable usage:
+          PASSWORD=$(keychain-fingerprint get myapp user@example.com)
+          # use $PASSWORD
+          unset PASSWORD
+        """,
+        stderr
+    )
 }
 
 func main() {
@@ -212,11 +303,19 @@ func main() {
         let account = args[3]
 
         // Touch ID authentication
-        guard authenticateWithTouchID(reason: "access the password of \(account)@\(service)") else {
+        guard
+            authenticateWithTouchID(
+                reason: "access the password of \(account)@\(service)",
+                account: "\(account)@\(service)"
+            )
+        else {
             exit(1)
         }
 
-        if let password = getKeychainPassword(service: service, account: account) {
+        if let password = getKeychainPassword(
+            service: service,
+            account: account
+        ) {
             print(password)
         } else {
             exit(1)
@@ -232,7 +331,12 @@ func main() {
         let account = args[3]
 
         // Touch ID authentication first
-        guard authenticateWithTouchID(reason: "set the password of \(account)@\(service)") else {
+        guard
+            authenticateWithTouchID(
+                reason: "set the password of \(account)@\(service)",
+                account: "\(account)@\(service)"
+            )
+        else {
             exit(1)
         }
 
@@ -242,7 +346,11 @@ func main() {
             exit(1)
         }
 
-        if setKeychainPassword(service: service, account: account, password: password) {
+        if setKeychainPassword(
+            service: service,
+            account: account,
+            password: password
+        ) {
             fputs("Password saved successfully\n", stderr)
         } else {
             exit(1)
@@ -258,7 +366,12 @@ func main() {
         let account = args[3]
 
         // Touch ID authentication
-        guard authenticateWithTouchID(reason: "delete the password of \(account)@\(service).") else {
+        guard
+            authenticateWithTouchID(
+                reason: "delete the password of \(account)@\(service).",
+                account: "\(account)@\(service)"
+            )
+        else {
             exit(1)
         }
 
@@ -270,7 +383,12 @@ func main() {
 
     case "list":
         // Touch ID authentication
-        guard authenticateWithTouchID(reason: "list items in your keychains") else {
+        guard
+            authenticateWithTouchID(
+                reason: "list items in your keychains",
+                account: "list"
+            )
+        else {
             exit(1)
         }
 
@@ -282,13 +400,22 @@ func main() {
         } else {
             let serviceHeader = "Service"
             let accountHeader = "Account"
-            let serviceWidth = max(serviceHeader.count, items.map(\.service.count).max() ?? 0)
+            let serviceWidth = max(
+                serviceHeader.count,
+                items.map(\.service.count).max() ?? 0
+            )
             let padService: (String) -> String = { value in
-                value + String(repeating: " ", count: max(0, serviceWidth - value.count))
+                value
+                    + String(
+                        repeating: " ",
+                        count: max(0, serviceWidth - value.count)
+                    )
             }
 
             print("\(padService(serviceHeader))  \(accountHeader)")
-            print("\(String(repeating: "-", count: serviceWidth))  \(String(repeating: "-", count: accountHeader.count))")
+            print(
+                "\(String(repeating: "-", count: serviceWidth))  \(String(repeating: "-", count: accountHeader.count))"
+            )
             for item in items {
                 print("\(padService(item.service))  \(item.account)")
             }
