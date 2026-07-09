@@ -278,12 +278,19 @@ func main() {
         let items = listKeychainItems(service: service)
 
         if items.isEmpty {
-            fputs("No items found\n", stderr)
+            print("No items found")
         } else {
-            fputs("Service\t\t\tAccount\n", stderr)
-            fputs("-------\t\t\t-------\n", stderr)
+            let serviceHeader = "Service"
+            let accountHeader = "Account"
+            let serviceWidth = max(serviceHeader.count, items.map(\.service.count).max() ?? 0)
+            let padService: (String) -> String = { value in
+                value + String(repeating: " ", count: max(0, serviceWidth - value.count))
+            }
+
+            print("\(padService(serviceHeader))  \(accountHeader)")
+            print("\(String(repeating: "-", count: serviceWidth))  \(String(repeating: "-", count: accountHeader.count))")
             for item in items {
-                fputs("\(item.service)\t\t\(item.account)\n", stderr)
+                print("\(padService(item.service))  \(item.account)")
             }
         }
 
