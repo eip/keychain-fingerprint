@@ -212,7 +212,7 @@ func main() {
         let account = args[3]
 
         // Touch ID authentication
-        guard authenticateWithTouchID(reason: "access the password of \(service)") else {
+        guard authenticateWithTouchID(reason: "access the password of \(account)@\(service)") else {
             exit(1)
         }
 
@@ -232,7 +232,7 @@ func main() {
         let account = args[3]
 
         // Touch ID authentication first
-        guard authenticateWithTouchID(reason: "set the password of \(service).") else {
+        guard authenticateWithTouchID(reason: "set the password of \(account)@\(service)") else {
             exit(1)
         }
 
@@ -258,7 +258,7 @@ func main() {
         let account = args[3]
 
         // Touch ID authentication
-        guard authenticateWithTouchID(reason: "delete the password of \(service).") else {
+        guard authenticateWithTouchID(reason: "delete the password of \(account)@\(service).") else {
             exit(1)
         }
 
@@ -270,7 +270,7 @@ func main() {
 
     case "list":
         // Touch ID authentication
-        guard authenticateWithTouchID(reason: "access information saved in your keychains.") else {
+        guard authenticateWithTouchID(reason: "list items in your keychains") else {
             exit(1)
         }
 
